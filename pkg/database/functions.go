@@ -20,7 +20,7 @@ func connectToDb(config Config.Settings)(db *sql.DB, err error) {
 			config.DB_TYPE = "sqlite"
 			log.Println("Database error:", err)
 			log.Println("Genji is unsupported on this architecture, switching to sqlite db type.")
-			db, err = sql.Open(config.DB_TYPE, config.DB_FULL_FILE_PATH)
+			db, err = sql.Open(config.DB_TYPE, config.DB_FULL_FILE_PATH + "?_busy_timeout=5000")
 			if err != nil {
 				err = errors.New(fmt.Sprintf("Database file error: %s", err.Error()))
 				log.Println(err)
@@ -43,7 +43,7 @@ func connectToDb(config Config.Settings)(db *sql.DB, err error) {
 			}
 		}
 	} else if config.DB_TYPE == "sqlite" {
-		db, err = sql.Open(config.DB_TYPE, config.DB_FULL_FILE_PATH)
+		db, err = sql.Open(config.DB_TYPE, config.DB_FULL_FILE_PATH + "?_busy_timeout=5000")
 		if err != nil {
 			config.DB_TYPE = "genji"
 			log.Println("Database file error:", err)
@@ -121,6 +121,11 @@ func createTables(db *sql.DB, config Config.Settings) (err error) {
 		}
 	}
 
+	_, err = db.Exec("CREATE TABLE if not exists Config(Id INT NOT NULL, HETZNER_ROBOT_USER TEXT, HETZNER_ROBOT_PASS TEXT, PRIMARY KEY(Id))")
+	if err != nil {
+		return
+	}
+
 	_, err = db.Exec("CREATE TABLE if not exists ServerData(Id INT NOT NULL, IP TEXT, Label TEXT,  Info TEXT, PRIMARY KEY(Id))")
 	if err != nil {
 		return
@@ -140,5 +145,32 @@ func InsertServerDataInDB (databaseConnection *sql.DB, serverData Data.ServerDat
 	}
 
 	_, err = databaseConnection.Exec("INSERT INTO ServerData(Id,IP,Label,Info) VALUES (?, ?, ?, ?)", id, serverData.IP, serverData.Label, serverData.Info)
+	return
+}
+
+
+func SaveSettingsInDB (databaseConnection *sql.DB, settings Config.Settings) (err error) {
+	var id int
+	err = databaseConnection.QueryRow("SELECT Id FROM Config WHERE Id = 1").Scan(&id)
+	if err != nil || id != 1 {
+		log.Println("Error: no config data found: ", err)
+		//no data - create 
+		_, err = databaseConnection.Exec("INSERT INTO Config(Id,HETZNER_ROBOT_USER,HETZNER_ROBOT_PASS) VALUES (?, ?, ?)", 1, settings.HETZNER_ROBOT_USER, settings.HETZNER_ROBOT_PASS)
+		if err != nil {
+		log.Println("Error: config data insertion failed: ", err)
+			return
+		} else {
+		log.Println("OK. Inserted credetinals to DB")
+		}
+	} else {
+		//data found - update
+		sqlStatement := `UPDATE Config SET HETZNER_ROBOT_USER = $2, HETZNER_ROBOT_PASS = $3 WHERE Id = $1;`
+		_, err = databaseConnection.Exec(sqlStatement, 1, settings.HETZNER_ROBOT_USER, settings.HETZNER_ROBOT_PASS)
+		if err != nil {
+			log.Println("Error: update failed: ", err)
+		} else {
+			log.Println("OK. Updated credentials in DB")
+		}
+	}
 	return
 }

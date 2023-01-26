@@ -6,8 +6,9 @@ import (
 	"flag"
 )
 
+
 type Settings struct {
-	APP_NAME, VERSION, DB_TYPE, DB_FILE_PATH, DB_FULL_FILE_PATH, PG_HOST, PG_USER, PG_PASS, PG_DB_NAME, PG_SSL string
+	APP_NAME, VERSION, DB_TYPE, DB_FILE_PATH, DB_FULL_FILE_PATH, PG_HOST, PG_USER, PG_PASS, PG_DB_NAME, PG_SSL, HETZNER_ROBOT_USER, HETZNER_ROBOT_PASS string
 	PG_PORT int
 }
 
@@ -37,6 +38,10 @@ func ParseFlags() (config Settings)  {
 	flag.StringVar(&config.PG_DB_NAME, "pgdbname", "eye", "PostgreSQL DB name.")
 	flag.StringVar(&config.PG_SSL, "pgssl", "prefer", "disable / allow / prefer / require / verify-ca / verify-full - PostgreSQL ssl modes: https://www.postgresql.org/docs/current/libpq-ssl.html")
 
+	//hetzner 
+	flag.StringVar(&config.HETZNER_ROBOT_USER, "hetzner-user", "", "Hetzner robot user name.")
+	flag.StringVar(&config.HETZNER_ROBOT_PASS, "hetzner-pass", "", "Hetzner robot password.")
+
 	//process all flags
 	flag.Parse()
 
@@ -50,5 +55,6 @@ func ParseFlags() (config Settings)  {
 		}
 		os.Exit(0)
 	}
+
 	return
 }
