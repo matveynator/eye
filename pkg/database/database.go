@@ -12,113 +12,143 @@ import (
 	"eye/pkg/config"
 )
 
-var DatabaseTask chan Data.ServerData
-var SettingsTaskChannel chan Config.Settings
-
-var dbRespawnLock chan int
-//по умолчанию оставляем только один процесс который будет брать задачи и записывать их в базу данных
-var databaseWorkersMaxCount int = 1
+var DataSaveTasks chan Data.ServerData
+var SettingsTasks chan Config.Settings
+var DatabaseCriticalErrors chan error
+var DatabaseWatchdogTasks chan int
+var databaseRespawnLock chan int
+var watchdogRespawnLock chan int
+var WorkerId, WatchdogId int
 
 func init() {
-	//initialise channel with tasks:
-	DatabaseTask = make(chan Data.ServerData)
+
+	//initial ids:
+	WorkerId = 1
+	WatchdogId = 1
 
 	//initialise channel with tasks:
-	SettingsTaskChannel = make(chan Config.Settings)
+	DataSaveTasks = make(chan Data.ServerData, 1000)
+
+	//initialise channel with tasks:
+	SettingsTasks = make(chan Config.Settings, 10)
+
+	//initialize blocking channel with database critical errors:
+	DatabaseCriticalErrors = make (chan error, 1)
+
+	//initialize watchdog blocking channel
+	DatabaseWatchdogTasks = make(chan int, 1)
 
 	//initialize blocking channel to guard respawn tasks
-	dbRespawnLock = make(chan int, databaseWorkersMaxCount)
+	databaseRespawnLock = make(chan int, 1)
+	watchdogRespawnLock = make(chan int, 1)
+
 }
 
 func Run(config Config.Settings) {
 
-	go func() {
-		for {
-			log.Printf("Locking... Respawn lock count: %d\n", len(dbRespawnLock))
-			// will block if there is databaseWorkersMaxCount in dbRespawnLock
-			dbRespawnLock <- 1
-			//sleep 1 second
-			log.Printf("Locked. Respawn lock count: %d\n", len(dbRespawnLock))
-			time.Sleep(1 * time.Second)
-			go databaseWorkerRun(len(dbRespawnLock), config)
+	//start database workers
+	if len(databaseRespawnLock)==0 {
+		go func() {
+			for {
+				//lock
+				databaseRespawnLock <- 1
+				//spawn database worker
+				go databaseWorkerRun(WorkerId, config)
+				//increment id
+				WorkerId++
+			}
+		}()
+	}
+
+	//later start watchdog (to guard database workers)
+	if len(watchdogRespawnLock)==0 {
+		//later start watchdog (to guard database workers)
+		watchdogRespawnLock <- 1
+		go watchdogRun(WatchdogId) 
+		WatchdogId++
+	}
+}
+
+func watchdogRun(watchdogId int) {
+	for {
+		if len(DataSaveTasks) == 0 && len(SettingsTasks) == 0 {
+			if len(DatabaseWatchdogTasks) == 0 {
+				time.Sleep(5 * time.Second)
+				log.Printf("Watchdog %d is alive.", watchdogId)
+				DatabaseWatchdogTasks <- 1
+			}
 		}
-	}()
+	}
 }
 
 //close dbConnection on programm exit
-func deferCleanup(db *sql.DB) {
+func cleanup(db *sql.DB) {
 	err := db.Close() 
 	if err != nil {
 		log.Println("Error closing database connection:", err)
 	}
-	log.Printf("Unlocking... Respawn lock count: %d\n", len(dbRespawnLock))
-	<- dbRespawnLock //unlock
-	log.Printf("Unlocked. Respawn lock count: %d\n", len(dbRespawnLock))
+	if len(databaseRespawnLock) == 1 {
+		log.Printf("Freeing database worker slot...")
+		<- databaseRespawnLock //unlock
+	}
 }
 
 func databaseWorkerRun(workerId int, config Config.Settings ) {
 	log.Printf("Started database worker %d", workerId)
 	dbConnection, err := connectToDb(config)
-	defer deferCleanup(dbConnection)
+	defer cleanup(dbConnection)
 
 	if err != nil  {
 		MyLog.Printonce(fmt.Sprintf("Database %s is unreachable. Error: %s",  config.DB_TYPE, err))
 		return
-
 	} else {
 		MyLog.Println(fmt.Sprintf("Database worker #%d connected to %s database", workerId, config.DB_TYPE))
 	}
 
-	//initialise dbConnection error channel
-	connectionErrorChannel := make(chan error)
-
-	go func() {
-		defer deferCleanup(dbConnection)
-		for {
-			time.Sleep(5 * time.Second)
-			_, err = dbConnection.Exec("UPDATE DBWatchDog SET UnixTime = ? WHERE ID = 1", time.Now().UnixMilli())
-			if err != nil {
-				connectionErrorChannel <- err
-				return
-			} else {
-				log.Println("Database is alive.")
-			}
-		}
-	}()
-
 	for {
 		select {
-			//в случае если есть задание в канале DatabaseTask
-		case currentDatabaseTask := <- DatabaseTask :
-			//log.Println("Received new database task with TagID:", currentDatabaseTask.TagID)
-			_, err := InsertServerDataInDB(dbConnection, currentDatabaseTask)
+		case <- DatabaseWatchdogTasks :
+			_, err = dbConnection.Exec("UPDATE DBWatchDog SET UnixTime = ? WHERE ID = 1", time.Now().UnixMilli())
 			if err != nil {
-				log.Printf("Database worker %d exited due to DatabaseTask processing error: %s\n", workerId, err)
-				return
+				//log.Println("len(DatabaseCriticalErrors) : ", len(DatabaseCriticalErrors))
+				if len(DatabaseCriticalErrors) == 0 {
+					DatabaseCriticalErrors <- err
+				}
+			} else {
+				log.Printf("Database worker %d is alive.", workerId)
 			}
-			//в случае если есть задание в канале SettingsTaskChannel
-		case currentSettingsTask := <- SettingsTaskChannel :
-			go func() {
-				//log.Println("Received new database task with TagID:", currentDatabaseTask.TagID)
-				err := SaveSettingsInDB(dbConnection, currentSettingsTask)
+		case dataSaveTask := <- DataSaveTasks :
+			//в случае если есть задание в канале DataSaveTasks
+			_, err := InsertServerDataInDB(dbConnection, dataSaveTask)
+			if err != nil {
+				log.Printf("Database worker %d exited due to dataSaveTask processing error: %s\n", workerId, err)
+				//return data back to channel
+				DataSaveTasks <- dataSaveTask
+				if len(DatabaseCriticalErrors) == 0 {
+					DatabaseCriticalErrors <- err
+				}
+			}
+		case settingsTask := <- SettingsTasks :
+				//в случае если есть задание в канале SettingsTasks
+				err := SaveSettingsInDB(dbConnection, settingsTask)
 				if err != nil {
-					log.Printf("Database worker %d exited due to SettingsTaskChannel processing error: %s\n", workerId, err)
-					//return task back
-					time.Sleep(1 * time.Second)
-					log.Printf("Returning task back... SettingsTaskChannel channel count: %d\n", len(SettingsTaskChannel))
-
-					SettingsTaskChannel <- currentSettingsTask
-					log.Printf("Returned. SettingsTaskChannel channel count: %d\n", len(SettingsTaskChannel))
-					//return
+					log.Printf("Database worker %d exited due to settingsTask processing error: %s\n", workerId, err)
+					//return data back to channel
+					SettingsTasks <- settingsTask
+					if len(DatabaseCriticalErrors) == 0 {
+						DatabaseCriticalErrors <- err
+					}
+					return
 				} else {
 					log.Println("OK. Settings saved.")
-					log.Printf("SettingsTaskChannel channel count: %d\n", len(SettingsTaskChannel))
 				}
-			}()
-		case networkError := <-connectionErrorChannel :
-			//обнаружена сетевая ошибка - завершаем гоурутину
-			log.Printf("Database worker %d exited due to connection error: %s\n", workerId, networkError)
+		case databaseCriticalError := <-DatabaseCriticalErrors :
+			//обнаружена критическая ошибка бд - завершаем гоурутину
+			log.Printf("Database worker %d exited due to critical error: %s\n", workerId, databaseCriticalError)
 			return
+		default:
+			time.Sleep(1 * time.Second)
+			log.Printf("Database worker %d sleeping..", workerId)
 		}
 	}
 }

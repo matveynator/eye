@@ -20,7 +20,7 @@ func UpdateCredentials(settings Config.Settings) (err error) {
 			return
 		} else {
 			log.Println("OK: connected to hetzner.")
-			Database.SettingsTaskChannel <- settings 
+			Database.SettingsTasks <- settings 
 		}
 	} else {
 		err = errors.New("Error: hetzner credentials undefined.")
